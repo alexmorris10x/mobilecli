@@ -430,6 +430,7 @@ jobs:
         GITHUB_TOKEN: ${{ github.token }}
       with:
         name: Version ${{ github.ref_name }}
+        prerelease: ${{ contains(github.ref_name, '-') }}
         files: |
           mobilecli-*.zip
 
