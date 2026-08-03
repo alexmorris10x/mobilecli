@@ -187,7 +187,7 @@ jobs:
     - name: Set version
       if: github.ref_type == 'tag'
       run: |
-        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-10x\.[0-9]+)?$ ]]; then
           echo "::error::Invalid release tag format: $GITHUB_REF_NAME"
           exit 1
         fi
@@ -246,7 +246,7 @@ jobs:
     - name: Set version
       if: github.ref_type == 'tag'
       run: |
-        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-10x\.[0-9]+)?$ ]]; then
           echo "::error::Invalid release tag format: $GITHUB_REF_NAME"
           exit 1
         fi
@@ -300,7 +300,7 @@ jobs:
     - name: Set version
       if: github.ref_type == 'tag'
       run: |
-        if ($env:GITHUB_REF_NAME -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        if ($env:GITHUB_REF_NAME -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-10x\.[0-9]+)?$') {
           Write-Error "Invalid release tag format: $env:GITHUB_REF_NAME"
           exit 1
         }
@@ -320,6 +320,7 @@ jobs:
           mobilecli-windows-arm64.exe
 
   e2e_test:
+    if: github.repository == 'mobile-next/mobilecli'
     runs-on: self-hosted
     timeout-minutes: 10
     needs: [build_on_macos]
@@ -349,23 +350,17 @@ jobs:
       run:
         make test-e2e
 
-  publish:
+  release:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      id-token: write  # Required for npm trusted publishing with OIDC
       contents: write
-    needs: [build_on_windows, build_on_linux, build_on_macos, e2e_test]
+    needs: [build_on_windows, build_on_linux, build_on_macos]
     steps:
     - uses: actions/checkout@v5
       with:
         persist-credentials: false
-
-    - uses: actions/setup-node@v5
-      with:
-        node-version: '24'
-        registry-url: 'https://registry.npmjs.org'
 
     - name: Download darwin build
       uses: actions/download-artifact@v6
@@ -387,7 +382,7 @@ jobs:
 
     - name: Zip builds
       run: |
-        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-10x\.[0-9]+)?$ ]]; then
           echo "::error::Invalid release tag format: $GITHUB_REF_NAME"
           exit 1
         fi
@@ -431,13 +426,49 @@ jobs:
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
       env:
-        GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        GITHUB_TOKEN: ${{ github.token }}
       with:
         name: Version ${{ github.ref_name }}
         files: |
           mobilecli-*.zip
 
-    - name: Publish
+  publish_npm:
+    if: github.repository == 'mobile-next/mobilecli' && github.ref_type == 'tag' && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    needs: [build_on_windows, build_on_linux, build_on_macos, e2e_test]
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-node@v5
+      with:
+        node-version: '24'
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Download darwin build
+      uses: actions/download-artifact@v6
+      with:
+        name: macos-build
+        path: mobilecli-darwin
+
+    - name: Download linux build
+      uses: actions/download-artifact@v6
+      with:
+        name: linux-build
+        path: mobilecli-linux
+
+    - name: Download windows build
+      uses: actions/download-artifact@v6
+      with:
+        name: windows-build
+        path: mobilecli-windows
+
+    - name: Publish to npm
       run: |
         # prepare binaries for distribution
         mv ./mobilecli-darwin/mobilecli-darwin-arm64 publish/npm/bin

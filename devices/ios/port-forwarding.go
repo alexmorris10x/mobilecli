@@ -1,7 +1,11 @@
 package ios
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sync"
 
 	goios "github.com/danielpaulus/go-ios/ios"
@@ -10,12 +14,18 @@ import (
 )
 
 type PortForwarder struct {
-	udid         string
-	connListener *forward.ConnListener
-	forwardMutex sync.Mutex
-	srcPort      int
-	dstPort      int
+	udid           string
+	listener       net.Listener
+	cancelForward  context.CancelFunc
+	forwardWorkers sync.WaitGroup
+	forwardMutex   sync.Mutex
+	srcPort        int
+	dstPort        int
 }
+
+type proxyConnectionFunc func(context.Context, io.ReadWriteCloser, int, uint16) error
+
+var startProxyConnection proxyConnectionFunc = forward.StartNewProxyConnection
 
 func NewPortForwarder(udid string) *PortForwarder {
 	return &PortForwarder{
@@ -27,16 +37,16 @@ func (pf *PortForwarder) Forward(srcPort, dstPort int) error {
 	pf.forwardMutex.Lock()
 	defer pf.forwardMutex.Unlock()
 
-	if pf.connListener != nil {
+	if pf.listener != nil {
 		return fmt.Errorf("port forwarding is already running from %d to %d", pf.srcPort, pf.dstPort)
 	}
 
-	if srcPort < 0 || srcPort > 65535 {
-		return fmt.Errorf("invalid source port %d: must be between 0 and 65535", srcPort)
+	if srcPort < 1 || srcPort > 65535 {
+		return fmt.Errorf("invalid source port %d: must be between 1 and 65535", srcPort)
 	}
 
-	if dstPort < 0 || dstPort > 65535 {
-		return fmt.Errorf("invalid destination port %d: must be between 0 and 65535", dstPort)
+	if dstPort < 1 || dstPort > 65535 {
+		return fmt.Errorf("invalid destination port %d: must be between 1 and 65535", dstPort)
 	}
 
 	pf.srcPort = srcPort
@@ -47,13 +57,17 @@ func (pf *PortForwarder) Forward(srcPort, dstPort int) error {
 		return fmt.Errorf("failed to get device %s: %w", pf.udid, err)
 	}
 
-	connListener, err := forward.Forward(device, uint16(srcPort), uint16(dstPort))
+	listener, err := listenLoopback(srcPort)
 	if err != nil {
-		return fmt.Errorf("failed to create port forwarder: %w", err)
+		return fmt.Errorf("failed to create loopback port forwarder: %w", err)
 	}
 
-	pf.connListener = connListener
-	utils.Verbose("Port forwarding started from %d to %d", srcPort, dstPort)
+	ctx, cancel := context.WithCancel(context.Background())
+	pf.listener = listener
+	pf.cancelForward = cancel
+	pf.forwardWorkers.Add(1)
+	go pf.acceptConnections(ctx, device.DeviceID, uint16(dstPort), listener)
+	utils.Verbose("Loopback port forwarding started from 127.0.0.1:%d to device port %d", srcPort, dstPort)
 
 	return nil
 }
@@ -62,17 +76,20 @@ func (pf *PortForwarder) Stop() error {
 	pf.forwardMutex.Lock()
 	defer pf.forwardMutex.Unlock()
 
-	if pf.connListener == nil {
+	if pf.listener == nil {
 		return fmt.Errorf("no port forwarding running")
 	}
 
-	err := pf.connListener.Close()
+	pf.cancelForward()
+	err := pf.listener.Close()
 	if err != nil {
 		utils.Verbose("Error stopping port forwarding %d->%d: %v", pf.srcPort, pf.dstPort, err)
 	}
+	pf.forwardWorkers.Wait()
 
 	utils.Verbose("Stopping port forwarding %d->%d", pf.srcPort, pf.dstPort)
-	pf.connListener = nil
+	pf.listener = nil
+	pf.cancelForward = nil
 	pf.srcPort = 0
 	pf.dstPort = 0
 
@@ -83,7 +100,41 @@ func (pf *PortForwarder) IsRunning() bool {
 	pf.forwardMutex.Lock()
 	defer pf.forwardMutex.Unlock()
 
-	return pf.connListener != nil
+	return pf.listener != nil
+}
+
+func (pf *PortForwarder) acceptConnections(ctx context.Context, deviceID int, dstPort uint16, listener net.Listener) {
+	defer pf.forwardWorkers.Done()
+
+	for {
+		clientConn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil || isClosedNetworkError(err) {
+				return
+			}
+			utils.Verbose("Error accepting forwarded connection: %v", err)
+			continue
+		}
+
+		pf.forwardWorkers.Add(1)
+		go func() {
+			defer pf.forwardWorkers.Done()
+			if err := startProxyConnection(ctx, clientConn, deviceID, dstPort); err != nil && ctx.Err() == nil {
+				utils.Verbose("Forwarded connection ended: %v", err)
+			}
+		}()
+	}
+}
+
+func isClosedNetworkError(err error) bool {
+	return errors.Is(err, net.ErrClosed)
+}
+
+func listenLoopback(port int) (net.Listener, error) {
+	return net.ListenTCP("tcp4", &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: port,
+	})
 }
 
 func (pf *PortForwarder) GetPorts() (srcPort, dstPort int) {
